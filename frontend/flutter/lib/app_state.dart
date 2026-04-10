@@ -183,14 +183,25 @@ class AppState extends ChangeNotifier {
   LocalVideoCatalog? _localVideoCatalog;
   LocalProcessSessionStore? _localProcessSessionStore;
   Map<String, dynamic>? _permissionStatus;
+  Map<String, dynamic>? _backendPermissionStatus;
   bool _backendCheckInFlight = false;
   DateTime? _lastBackendCheckAt;
   bool _nativeRuntimeBootstrapRequested = false;
   bool _backendActivationRequestedByUser = false;
   bool _nativeRecordingFallbackToBackend = false;
   Map<String, dynamic>? get permissionStatus => _permissionStatus;
+  Map<String, dynamic>? get backendPermissionStatus => _backendPermissionStatus;
   bool get hasRequestedBackendActivation => _backendActivationRequestedByUser;
   bool get usingBackendRecordingFallback => _nativeRecordingFallbackToBackend;
+  bool _floatingBallPreferredVisible =
+      Platform.isMacOS || Platform.isWindows ? true : false;
+  String? _floatingBallLastCommand;
+  DateTime? _floatingBallLastCommandAt;
+  bool get supportsFloatingBallControls =>
+      Platform.isMacOS || Platform.isWindows;
+  bool get floatingBallPreferredVisible => _floatingBallPreferredVisible;
+  String? get floatingBallLastCommand => _floatingBallLastCommand;
+  DateTime? get floatingBallLastCommandAt => _floatingBallLastCommandAt;
 
   late ChatApi _chatApi;
   late ProcessApi _processApi;
@@ -734,6 +745,41 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  void _recordFloatingBallCommand(String command, {bool? visible}) {
+    _floatingBallLastCommand = command;
+    _floatingBallLastCommandAt = DateTime.now();
+    if (visible != null) {
+      _floatingBallPreferredVisible = visible;
+    }
+    notifyListeners();
+  }
+
+  Future<void> showFloatingBallController() async {
+    if (!supportsFloatingBallControls) {
+      return;
+    }
+    await FloatingBallService.show();
+    _recordFloatingBallCommand('show', visible: true);
+  }
+
+  Future<void> hideFloatingBallController() async {
+    if (!supportsFloatingBallControls) {
+      return;
+    }
+    await FloatingBallService.hide();
+    _recordFloatingBallCommand('hide', visible: false);
+  }
+
+  Future<void> rebalanceFloatingBallController() async {
+    if (!supportsFloatingBallControls) {
+      return;
+    }
+    await FloatingBallService.hide();
+    await Future.delayed(const Duration(milliseconds: 120));
+    await FloatingBallService.show();
+    _recordFloatingBallCommand('rebalance', visible: true);
+  }
+
   void requestVideoRefresh({bool notify = true}) {
     _videoRefreshVersion += 1;
     if (notify) {
@@ -772,6 +818,9 @@ class AppState extends ChangeNotifier {
   String screenRecordingPermissionHint() {
     final runtimePath =
         (_permissionStatus?['runtime_executable'] as String?)?.trim() ?? '';
+    final backendRuntimePath =
+        (_backendPermissionStatus?['runtime_executable'] as String?)?.trim() ??
+            '';
     final appHintFromStatus =
         (_permissionStatus?['app_bundle_hint'] as String?)?.trim() ?? '';
     final detectedBundle = BuildInfo.detectAppBundlePath()?.trim() ?? '';
@@ -779,6 +828,10 @@ class AppState extends ChangeNotifier {
     final targets = <String>[];
     if (runtimePath.isNotEmpty) {
       targets.add(runtimePath);
+    }
+    if (backendRuntimePath.isNotEmpty &&
+        !targets.any((entry) => entry == backendRuntimePath)) {
+      targets.add(backendRuntimePath);
     }
     if (appHintFromStatus.isNotEmpty &&
         !targets.any((entry) => entry == appHintFromStatus)) {
@@ -790,10 +843,10 @@ class AppState extends ChangeNotifier {
     }
     final homePath = (Platform.environment['HOME'] ?? '').trim();
     if (homePath.isNotEmpty) {
-      final backendRuntimePath =
+      final defaultBackendRuntimePath =
           '$homePath/.memscreen/runtime/.venv/bin/python';
-      if (!targets.any((entry) => entry == backendRuntimePath)) {
-        targets.add(backendRuntimePath);
+      if (!targets.any((entry) => entry == defaultBackendRuntimePath)) {
+        targets.add(defaultBackendRuntimePath);
       }
     }
     if (targets.isEmpty) {
@@ -812,7 +865,16 @@ class AppState extends ChangeNotifier {
       return screenRecordingPermissionHint();
     }
     if (lower.contains('accessibility') || lower.contains('input monitoring')) {
-      return 'Keyboard/Mouse permission is missing. Allow ~/.memscreen/runtime/.venv/bin/python in Accessibility and Input Monitoring, then restart the app.';
+      final runtimePath =
+          (_backendPermissionStatus?['runtime_executable'] as String?)
+                  ?.trim() ??
+              '';
+      final fallbackHome = (Platform.environment['HOME'] ?? '').trim();
+      final fallback = fallbackHome.isNotEmpty
+          ? '$fallbackHome/.memscreen/runtime/.venv/bin/python'
+          : '~/.memscreen/runtime/.venv/bin/python';
+      final target = runtimePath.isNotEmpty ? runtimePath : fallback;
+      return 'Keyboard/Mouse permission is missing. Allow $target in Accessibility and Input Monitoring, then restart the app.';
     }
     return 'Failed to start recording: $raw';
   }
@@ -825,15 +887,29 @@ class AppState extends ChangeNotifier {
       return _lastRecordingSmokeCheckSummary ??
           'Running 2-second smoke check...';
     }
+    var preferBackend = false;
     if (enforcesScreenRecordingPermissionFlow &&
         !hasScreenRecordingPermission) {
-      await promptScreenRecordingPermissionFlow();
-      const summary =
-          'Permission: Screen Recording is still not active, so the smoke check cannot start.';
-      markRecordingSmokeCheckStarted();
-      markRecordingSmokeCheckFinished(summary: summary);
-      _recordingTrackingState.pendingRecordingNotice = summary;
-      return summary;
+      // If the app bundle does not have permission yet, still allow the smoke
+      // check to run via backend fallback when the backend runtime has already
+      // been granted access (common in local/dev setups).
+      final backendStatus = await refreshBackendPermissionStatus(
+        promptSystem: true,
+        notify: false,
+      );
+      final screen = backendStatus?['screen_recording'];
+      final backendGranted = screen is Map && screen['granted'] == true;
+      if (backendGranted) {
+        preferBackend = true;
+      } else {
+        await promptScreenRecordingPermissionFlow();
+        const summary =
+            'Permission: Screen Recording is still not active, so the smoke check cannot start.';
+        markRecordingSmokeCheckStarted();
+        markRecordingSmokeCheckFinished(summary: summary);
+        _recordingTrackingState.pendingRecordingNotice = summary;
+        return summary;
+      }
     }
 
     markRecordingSmokeCheckStarted();
@@ -846,6 +922,7 @@ class AppState extends ChangeNotifier {
         mode: smokeMode,
         screenIndex: screenIndex,
         screenDisplayId: screenDisplayId,
+        preferBackend: preferBackend,
       );
       const summary =
           'Smoke check: A 2-second recording test has started. Wait for it to finish and review Last result below.';
@@ -896,6 +973,28 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  Future<Map<String, dynamic>?> refreshBackendPermissionStatus({
+    bool promptSystem = false,
+    bool notify = true,
+  }) async {
+    if (!isBackendConnected) {
+      return _backendPermissionStatus;
+    }
+    try {
+      final status = await _client.get(
+        '/permissions/status?prompt=${promptSystem ? 'true' : 'false'}',
+      );
+      _backendPermissionStatus = status;
+      if (notify) {
+        notifyListeners();
+      }
+      return status;
+    } catch (e) {
+      debugPrint('[AppState] Failed to refresh backend permission status: $e');
+      return _backendPermissionStatus;
+    }
+  }
+
   Future<void> openPermissionSettings(String area) async {
     try {
       if (useNativeMacOSPermissions) {
@@ -935,6 +1034,10 @@ class AppState extends ChangeNotifier {
 
   Future<void> promptScreenRecordingPermissionFlow() async {
     await refreshPermissionStatus(promptSystem: true);
+    // In macOS dev setups, screen capture can be performed by the backend
+    // python runtime (Terminal-launched) instead of the app bundle. Refresh
+    // backend permissions too so we can surface the correct runtime path hint.
+    await refreshBackendPermissionStatus(promptSystem: true, notify: false);
     await openPermissionSettings('screen_recording');
   }
 
@@ -1272,23 +1375,10 @@ class AppState extends ChangeNotifier {
       );
       if (!result.ok) {
         final errorText = result.error ?? 'Failed to start native recording';
-        if (_shouldFallbackToBackendRecorder(errorText) && isBackendConnected) {
-          _nativeRecordingFallbackToBackend = true;
+        if (_isNativeRecorderPermissionBlocked(errorText)) {
+          final hint = screenRecordingPermissionHint();
           _recordingTrackingState.pendingRecordingNotice =
-              'Native recorder is blocked by permission. '
-              'Switched to backend recorder fallback.';
-          await _recordingLifecycleCoordinator.start(
-            lifecycleState: _recordingLifecycleState,
-            trackingState: _recordingTrackingState,
-            duration: duration,
-            interval: interval,
-            mode: mode,
-            region: region,
-            screenIndex: screenIndex,
-            screenDisplayId: screenDisplayId,
-            windowTitle: windowTitle,
-          );
-          return;
+              '$hint You can also start via backend fallback from the Record screen while permissions are pending.';
         }
         throw Exception(errorText);
       }
@@ -1343,7 +1433,7 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  bool _shouldFallbackToBackendRecorder(String errorText) {
+  bool _isNativeRecorderPermissionBlocked(String errorText) {
     final lower = errorText.toLowerCase();
     return lower.contains('permission') ||
         lower.contains('not permitted') ||

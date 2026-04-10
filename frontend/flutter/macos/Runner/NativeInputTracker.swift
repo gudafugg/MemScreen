@@ -49,6 +49,22 @@ final class NativeInputTracker {
         ]
     }
 
+    func markBaseline() -> [String: Any] {
+        guard isTracking else {
+            return [
+                "ok": false,
+                "error": "Tracking is not active, cannot mark baseline.",
+            ]
+        }
+        events.removeAll()
+        startedAt = Date()
+        return [
+            "ok": true,
+            "isTracking": true,
+            "eventCount": 0,
+        ]
+    }
+
     func saveSession() -> [String: Any] {
         guard !events.isEmpty else {
             return ["ok": false, "error": "No events to save"]

@@ -26,6 +26,7 @@ class _RecordingScreenState extends State<RecordingScreen> {
 
   String? _recordingNotice;
   _RecordingNoticeLevel _recordingNoticeLevel = _RecordingNoticeLevel.info;
+  bool _showAdvanced = false;
 
   Timer? _pollTimer;
   AppState? _appState;
@@ -201,17 +202,38 @@ class _RecordingScreenState extends State<RecordingScreen> {
     }
   }
 
-  Future<void> _start() async {
+  Future<void> _start({bool preferBackend = false}) async {
     final appState = context.read<AppState>();
 
     try {
-      if (Theme.of(context).platform == TargetPlatform.macOS &&
-          !appState.hasScreenRecordingPermission) {
-        await appState.promptScreenRecordingPermissionFlow();
-        if (mounted) {
-          _showRecordingNotice(appState.screenRecordingPermissionHint());
+      if (Theme.of(context).platform == TargetPlatform.macOS) {
+        if (preferBackend) {
+          if (!appState.isBackendConnected) {
+            _showRecordingNotice(
+              'Backend is not connected yet. Wait for it to start, then retry.',
+            );
+            return;
+          }
+          final status = await appState.refreshBackendPermissionStatus(
+            promptSystem: true,
+            notify: false,
+          );
+          final screen = status?['screen_recording'];
+          final granted = screen is Map && screen['granted'] == true;
+          if (!granted) {
+            await appState.openPermissionSettings('screen_recording');
+            if (mounted) {
+              _showRecordingNotice(appState.screenRecordingPermissionHint());
+            }
+            return;
+          }
+        } else if (!appState.hasScreenRecordingPermission) {
+          await appState.promptScreenRecordingPermissionFlow();
+          if (mounted) {
+            _showRecordingNotice(appState.screenRecordingPermissionHint());
+          }
+          return;
         }
-        return;
       }
 
       final mode = _screenIndex == null ? 'fullscreen' : 'fullscreen-single';
@@ -221,6 +243,7 @@ class _RecordingScreenState extends State<RecordingScreen> {
         mode: mode,
         screenIndex: _screenIndex,
         screenDisplayId: _screenDisplayId,
+        preferBackend: preferBackend,
       );
 
       _consumePendingRecordingNotice(showSnackBar: true);
@@ -325,9 +348,29 @@ class _RecordingScreenState extends State<RecordingScreen> {
         (permissionStatus?['runtime_executable'] as String?)?.trim() ?? '';
     final appBundleHint =
         (permissionStatus?['app_bundle_hint'] as String?)?.trim() ?? '';
-    final effectiveRuntimePath = runtimePath.isNotEmpty
-        ? runtimePath
-        : '${Platform.environment['HOME'] ?? ''}/.memscreen/runtime/.venv/bin/python';
+    final backendStatus = appState.backendPermissionStatus;
+    final backendRuntimePath =
+        (backendStatus?['runtime_executable'] as String?)?.trim() ?? '';
+    final homePath = (Platform.environment['HOME'] ?? '').trim();
+    final fallbackRuntimePath = homePath.isNotEmpty
+        ? '$homePath/.memscreen/runtime/.venv/bin/python'
+        : '';
+
+    // Prefer backend python runtime first, because it is commonly the actual
+    // screen-capture process in local/dev setups.
+    final targets = <String>[];
+    final effectiveRuntimePath = backendRuntimePath.isNotEmpty
+        ? backendRuntimePath
+        : fallbackRuntimePath;
+    if (effectiveRuntimePath.isNotEmpty) {
+      targets.add(effectiveRuntimePath);
+    }
+    final effectiveAppHint =
+        appBundleHint.isNotEmpty ? appBundleHint : runtimePath;
+    if (effectiveAppHint.isNotEmpty &&
+        !targets.any((entry) => entry == effectiveAppHint)) {
+      targets.add(effectiveAppHint);
+    }
 
     return Container(
       padding: const EdgeInsets.all(12),
@@ -347,27 +390,20 @@ class _RecordingScreenState extends State<RecordingScreen> {
           ),
           const SizedBox(height: 8),
           Text(
-            'Allow these entries in macOS System Settings > Privacy & Security > Screen Recording:',
+            'Enable these entries in macOS Settings > Privacy & Security > Screen Recording:',
             style: TextStyle(color: colorScheme.onErrorContainer),
           ),
           const SizedBox(height: 6),
-          Text(
-            '1. $effectiveRuntimePath',
-            style: TextStyle(
-              color: colorScheme.onErrorContainer,
-              fontFamily: 'Menlo',
-              fontSize: 12,
-            ),
-          ),
-          if (appBundleHint.isNotEmpty && appBundleHint != effectiveRuntimePath)
-            Text(
-              '2. $appBundleHint',
+          ...targets.asMap().entries.map((entry) {
+            return Text(
+              '${entry.key + 1}. ${entry.value}',
               style: TextStyle(
                 color: colorScheme.onErrorContainer,
                 fontFamily: 'Menlo',
                 fontSize: 12,
               ),
-            ),
+            );
+          }),
           const SizedBox(height: 6),
           Text(
             'After granting access, completely quit and reopen MemScreen.',
@@ -386,6 +422,12 @@ class _RecordingScreenState extends State<RecordingScreen> {
                 icon: const Icon(Icons.security_outlined),
                 label: const Text('Open Permission Flow'),
               ),
+              if (appState.isBackendConnected)
+                FilledButton.tonalIcon(
+                  onPressed: () => _start(preferBackend: true),
+                  icon: const Icon(Icons.cloud_sync_outlined),
+                  label: const Text('Start via Backend'),
+                ),
               FilledButton.tonalIcon(
                 onPressed: _load,
                 icon: const Icon(Icons.refresh),
@@ -398,48 +440,300 @@ class _RecordingScreenState extends State<RecordingScreen> {
     );
   }
 
+  String _formatInterval(double seconds) {
+    if (seconds % 1 == 0) {
+      return '${seconds.toInt()}s';
+    }
+    return '${seconds.toStringAsFixed(1)}s';
+  }
+
+  Widget _statusChip({
+    required IconData icon,
+    required String label,
+    required String value,
+    Color? color,
+    Color? textColor,
+  }) {
+    final scheme = Theme.of(context).colorScheme;
+    final bg = color ?? scheme.surfaceContainerHighest;
+    final fg = textColor ?? scheme.onSurfaceVariant;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 16, color: fg),
+          const SizedBox(width: 6),
+          Text(
+            '$label · $value',
+            style: TextStyle(
+              color: fg,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildQuickActions(AppState appState, bool isRecording) {
+    final canUseBackendFallback = appState.isBackendConnected;
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        OutlinedButton.icon(
+          onPressed: isRecording ? null : _runSmokeCheck,
+          icon: const Icon(Icons.health_and_safety_outlined),
+          label: const Text('2s Smoke Check'),
+        ),
+        OutlinedButton.icon(
+          onPressed: isRecording || !canUseBackendFallback
+              ? null
+              : _startBackendFallback,
+          icon: const Icon(Icons.cloud_sync_outlined),
+          label: const Text('Start via Backend'),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _runSmokeCheck() async {
+    final appState = context.read<AppState>();
+    try {
+      final summary = await appState.runRecordingSmokeCheck(
+        screenIndex: _screenIndex,
+        screenDisplayId: _screenDisplayId,
+      );
+      if (!mounted) return;
+      _showRecordingNotice(summary);
+    } catch (e) {
+      if (!mounted) return;
+      _showRecordingNotice('Smoke check failed: $e');
+    }
+  }
+
+  Future<void> _startBackendFallback() {
+    return _start(preferBackend: true);
+  }
+
+  Future<void> _toggleFloatingBall(bool visible) async {
+    final appState = context.read<AppState>();
+    if (visible) {
+      await appState.showFloatingBallController();
+    } else {
+      await appState.hideFloatingBallController();
+    }
+  }
+
+  Future<void> _rebalanceFloatingBall() async {
+    final appState = context.read<AppState>();
+    await appState.rebalanceFloatingBallController();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Floating controller rebalanced')),
+    );
+  }
+
+  String _formatTimestamp(DateTime? timestamp) {
+    if (timestamp == null) {
+      return 'never';
+    }
+    final local = timestamp.toLocal();
+    final now = DateTime.now();
+    final sameDay = local.year == now.year &&
+        local.month == now.month &&
+        local.day == now.day;
+    final dayPart = sameDay ? 'Today' : '${local.month}/${local.day}';
+    final timePart =
+        '${local.hour.toString().padLeft(2, '0')}:${local.minute.toString().padLeft(2, '0')}';
+    return '$dayPart $timePart';
+  }
+
+  String _capitalize(String value) {
+    if (value.isEmpty) {
+      return value;
+    }
+    return value[0].toUpperCase() + value.substring(1);
+  }
+
+  Widget _buildFloatingBallCard(AppState appState) {
+    if (!appState.supportsFloatingBallControls) {
+      return const SizedBox.shrink();
+    }
+    final visible = appState.floatingBallPreferredVisible;
+    final lastAction = appState.floatingBallLastCommand;
+    final actionDescription = (lastAction ?? '').isEmpty
+        ? null
+        : '${_capitalize(lastAction!)} · ${_formatTimestamp(appState.floatingBallLastCommandAt)}';
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHigh,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: visible ? scheme.primary : scheme.outlineVariant,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Icon(
+                visible ? Icons.adjust : Icons.blur_circular,
+                color: visible ? scheme.primary : scheme.onSurfaceVariant,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Floating Controller',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+              ),
+              Switch(
+                value: visible,
+                onChanged: (value) => _toggleFloatingBall(value),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            visible
+                ? 'Floating controls stay above other windows for quick start/stop.'
+                : 'Floating controls are hidden. Use the switch to bring them back.',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+          if (actionDescription != null) ...[
+            const SizedBox(height: 4),
+            Text(
+              'Last action: $actionDescription',
+              style: Theme.of(context)
+                  .textTheme
+                  .bodySmall
+                  ?.copyWith(color: scheme.onSurfaceVariant),
+            ),
+          ],
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              OutlinedButton.icon(
+                onPressed: () => _rebalanceFloatingBall(),
+                icon: const Icon(Icons.center_focus_strong),
+                label: const Text('Rebalance'),
+              ),
+              OutlinedButton.icon(
+                onPressed: visible ? () => _toggleFloatingBall(false) : null,
+                icon: const Icon(Icons.visibility_off),
+                label: const Text('Hide'),
+              ),
+              OutlinedButton.icon(
+                onPressed: visible ? null : () => _toggleFloatingBall(true),
+                icon: const Icon(Icons.visibility),
+                label: const Text('Show'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildMainCard(AppState appState) {
     final isRecording = _status?.isRecording ?? false;
+    final colorScheme = Theme.of(context).colorScheme;
+    final statusColor = isRecording ? colorScheme.error : colorScheme.primary;
+    final statusIcon =
+        isRecording ? Icons.fiber_manual_record : Icons.play_circle_outline;
+    final statusLabel = isRecording ? 'Recording now' : 'Ready to capture';
+    final chips = <Widget>[
+      _statusChip(
+        icon: Icons.memory,
+        label: 'Engine',
+        value: _recordingEngineLabel(appState),
+        color: appState.usingBackendRecordingFallback
+            ? colorScheme.secondaryContainer
+            : null,
+        textColor: appState.usingBackendRecordingFallback
+            ? colorScheme.onSecondaryContainer
+            : null,
+      ),
+      _statusChip(
+        icon: Icons.graphic_eq,
+        label: 'Audio',
+        value: _audioLabel(appState),
+      ),
+      if (_showAdvanced)
+        _statusChip(
+          icon: Icons.schedule,
+          label: 'Duration',
+          value: '${appState.recordingDurationSec}s',
+        ),
+      if (_showAdvanced)
+        _statusChip(
+          icon: Icons.timelapse,
+          label: 'Interval',
+          value: _formatInterval(appState.recordingIntervalSec),
+        ),
+      if (_showAdvanced && appState.autoTrackInputWithRecording)
+        _statusChip(
+          icon: Icons.monitor_heart,
+          label: 'Tracking',
+          value: 'Auto',
+        ),
+    ];
+    final shouldShowPermissionHint =
+        Theme.of(context).platform == TargetPlatform.macOS &&
+            !appState.hasScreenRecordingPermission;
 
     return Container(
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.surfaceContainerLow,
+        color: colorScheme.surfaceContainerLow,
         borderRadius: BorderRadius.circular(12),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Text(
-            'Screen Recording',
-            style: Theme.of(context).textTheme.titleMedium,
-          ),
-          const SizedBox(height: 8),
-          Text(
-            isRecording ? 'Status: Recording' : 'Status: Ready',
-            style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                  fontWeight: FontWeight.w700,
-                  color: isRecording
-                      ? Theme.of(context).colorScheme.error
-                      : Theme.of(context).colorScheme.primary,
+          Row(
+            children: [
+              Icon(statusIcon, color: statusColor),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Screen Recording',
+                  style: Theme.of(context).textTheme.titleMedium,
                 ),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            'Engine: ${_recordingEngineLabel(appState)}',
-            style: Theme.of(context).textTheme.bodySmall,
-          ),
-          const SizedBox(height: 4),
-          Text(
-            'Duration ${appState.recordingDurationSec}s · Interval ${appState.recordingIntervalSec}s · Audio ${_audioLabel(appState)}',
-            style: Theme.of(context).textTheme.bodySmall,
+              ),
+              Text(
+                statusLabel,
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                      fontWeight: FontWeight.w600,
+                      color: statusColor,
+                    ),
+              ),
+            ],
           ),
           const SizedBox(height: 12),
-          _buildPermissionHint(appState),
-          if (Theme.of(context).platform == TargetPlatform.macOS &&
-              !appState.hasScreenRecordingPermission)
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: chips,
+          ),
+          const SizedBox(height: 12),
+          if (shouldShowPermissionHint) ...[
+            _buildPermissionHint(appState),
             const SizedBox(height: 12),
+          ],
           DropdownButtonFormField<int>(
+            key: ValueKey(_screenIndex ?? -1),
             initialValue: _screenIndex ?? -1,
             decoration: const InputDecoration(
               labelText: 'Display target',
@@ -477,7 +771,7 @@ class _RecordingScreenState extends State<RecordingScreen> {
               icon: const Icon(Icons.stop),
               label: const Text('Stop Recording'),
               style: FilledButton.styleFrom(
-                backgroundColor: Theme.of(context).colorScheme.error,
+                backgroundColor: colorScheme.error,
               ),
             )
           else
@@ -486,6 +780,22 @@ class _RecordingScreenState extends State<RecordingScreen> {
               icon: const Icon(Icons.fiber_manual_record),
               label: const Text('Start Recording'),
             ),
+          const SizedBox(height: 4),
+          Align(
+            alignment: Alignment.centerRight,
+            child: TextButton.icon(
+              onPressed: () => setState(() => _showAdvanced = !_showAdvanced),
+              icon: Icon(
+                _showAdvanced ? Icons.expand_less : Icons.expand_more,
+                size: 18,
+              ),
+              label: Text(_showAdvanced ? 'Hide advanced' : 'Show advanced'),
+            ),
+          ),
+          if (_showAdvanced) ...[
+            const SizedBox(height: 8),
+            _buildQuickActions(appState, isRecording),
+          ],
         ],
       ),
     );
@@ -500,6 +810,9 @@ class _RecordingScreenState extends State<RecordingScreen> {
     }
 
     final appState = context.watch<AppState>();
+    final showFloatingBallCard =
+        appState.supportsFloatingBallControls && _showAdvanced;
+    final hasNotice = (_recordingNotice ?? '').isNotEmpty;
 
     return Scaffold(
       appBar: AppBar(
@@ -512,20 +825,32 @@ class _RecordingScreenState extends State<RecordingScreen> {
           ),
         ],
       ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
-        child: Center(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 520),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                _buildMainCard(appState),
-                const SizedBox(height: 10),
-                _buildNoticeCard(),
-              ],
+      body: RefreshIndicator(
+        onRefresh: _load,
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.all(16),
+          children: [
+            Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 560),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _buildMainCard(appState),
+                    if (showFloatingBallCard) ...[
+                      const SizedBox(height: 12),
+                      _buildFloatingBallCard(appState),
+                    ],
+                    if (hasNotice) ...[
+                      const SizedBox(height: 12),
+                      _buildNoticeCard(),
+                    ],
+                  ],
+                ),
+              ),
             ),
-          ),
+          ],
         ),
       ),
     );

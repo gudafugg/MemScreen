@@ -162,6 +162,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
       await context.read<AppState>().refreshPermissionStatus(
             promptSystem: promptSystem,
           );
+      await context.read<AppState>().refreshBackendPermissionStatus(
+            promptSystem: promptSystem,
+            notify: false,
+          );
     } catch (e) {
       if (showError && mounted) {
         final msg = e is ApiException ? e.message : e.toString();
@@ -690,10 +694,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Widget _permissionsCard() {
     final theme = Theme.of(context);
-    final permissionStatus = context.watch<AppState>().permissionStatus;
-    final runtimePath = (permissionStatus?['runtime_executable'] ??
-            '~/.memscreen/runtime/.venv/bin/python')
+    final appState = context.watch<AppState>();
+    final permissionStatus = appState.permissionStatus;
+    final backendPermissionStatus = appState.backendPermissionStatus;
+    final appHint = (permissionStatus?['app_bundle_hint'] ??
+            permissionStatus?['runtime_executable'] ??
+            '')
         .toString();
+    final backendRuntimePath =
+        (backendPermissionStatus?['runtime_executable'] ??
+                '~/.memscreen/runtime/.venv/bin/python')
+            .toString();
 
     Widget rowFor(String title, String key) {
       final section = permissionStatus?[key];
@@ -763,7 +774,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ],
           ),
           Text(
-            'Required runtime path: $runtimePath',
+            'App: $appHint',
+            style: TextStyle(
+              color: theme.colorScheme.onSurfaceVariant,
+              fontSize: 12,
+            ),
+          ),
+          Text(
+            'Backend runtime: $backendRuntimePath',
             style: TextStyle(
               color: theme.colorScheme.onSurfaceVariant,
               fontSize: 12,
@@ -800,7 +818,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
           const SizedBox(height: 8),
           Text(
-            'Allow both MemScreen.app and the runtime path above where relevant, then quit and reopen MemScreen.',
+            'If recording or tracking still fails, allow both the app and the backend runtime above, then quit and reopen MemScreen.',
             style: TextStyle(
               color: theme.colorScheme.onSurfaceVariant,
               fontSize: 12,

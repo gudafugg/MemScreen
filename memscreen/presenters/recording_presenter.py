@@ -285,23 +285,27 @@ class RecordingPresenter(BasePresenter):
             (is_ready, error_message)
         """
         if sys.platform == "darwin":
-            # On macOS, ask the system for screen-capture permission when possible.
+            # Prefer the ctypes-based probe so we don't depend on pyobjc at runtime.
+            # We keep this probe non-interactive (prompt=False) because the API
+            # handler runs in a threadpool and permission prompts are more
+            # reliable when initiated from the main app UI.
             try:
-                from Quartz import (  # type: ignore
-                    CGPreflightScreenCaptureAccess,
-                    CGRequestScreenCaptureAccess,
+                from memscreen.macos_permissions import (
+                    check_screen_recording_permission,
+                    open_privacy_settings,
                 )
 
-                if not bool(CGPreflightScreenCaptureAccess()):
-                    return (
-                        False,
-                        "Screen recording permission is required. "
-                        "Allow MemScreen.app and the runtime process, then restart the app. "
-                        "Path: ~/.memscreen/runtime/.venv/bin/python",
-                    )
+                granted, message = check_screen_recording_permission(prompt=False)
+                if not granted:
+                    # Still open the correct Settings pane as a convenience.
+                    try:
+                        open_privacy_settings("screen_recording")
+                    except Exception:
+                        pass
+                    return False, message
             except Exception as e:
                 # Non-fatal: fall back to runtime grab probe below.
-                print(f"[RecordingPresenter] Screen permission preflight API unavailable: {e}")
+                print(f"[RecordingPresenter] Screen permission preflight failed: {e}")
 
         try:
             from PIL import ImageGrab
@@ -310,12 +314,17 @@ class RecordingPresenter(BasePresenter):
                 return False, "Failed to capture screen frame during pre-flight check."
         except Exception as e:
             error_msg = str(e).lower()
-            if "permission" in error_msg or "denied" in error_msg or "screen" in error_msg:
-                return (
-                    False,
-                    "Screen recording permission is required. "
-                    "Grant access in System Settings > Privacy & Security > Screen Recording.",
-                )
+            if "permission" in error_msg or "denied" in error_msg:
+                try:
+                    from memscreen.macos_permissions import create_permission_message
+
+                    return False, create_permission_message()
+                except Exception:
+                    return (
+                        False,
+                        "Screen recording permission is required. "
+                        "Grant access in System Settings > Privacy & Security > Screen Recording.",
+                    )
             return False, f"Failed to verify screen capture readiness: {e}"
 
         return True, None
@@ -1246,7 +1255,14 @@ Content Tags: {", ".join(content_tags)}
             print("[RecordingPresenter] Permission was denied during pre-flight check - not starting recording loop")
             self.is_recording = False
             if self.view:
-                self.view.show_error("Screen recording permission is required. Please grant permission in System Settings > Privacy & Security > Screen Recording, then restart the app.")
+                self.view.show_error(
+                    self.last_start_error
+                    or (
+                        "Screen recording permission is required. "
+                        "Grant access in System Settings > Privacy & Security > Screen Recording, "
+                        "then quit and reopen MemScreen."
+                    )
+                )
             return
 
         try:
