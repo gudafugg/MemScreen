@@ -50,6 +50,30 @@ async def open_permission_settings(area: str = Query(...)):
         return {"ok": False, "area": area, "error": str(e)}
 
 
+@router.post("/permissions/recheck")
+async def recheck_permissions(prompt: bool = Query(False)):
+    """Clear cache and recheck permissions, useful after user changed settings."""
+    try:
+        from memscreen.macos_permissions import get_permission_diagnostics, force_recheck_permission
+
+        # Force recheck screen recording, get full diagnostics
+        if prompt:
+            force_recheck_permission(prompt=True)
+        else:
+            force_recheck_permission(prompt=False)
+        return get_permission_diagnostics(prompt=prompt)
+    except Exception as e:
+        return {
+            "platform": "unknown",
+            "runtime_executable": "",
+            "app_bundle_hint": "/Applications/MemScreen.app",
+            "screen_recording": {"granted": False, "message": str(e)},
+            "accessibility": {"granted": False, "message": str(e)},
+            "input_monitoring": {"granted": False, "message": str(e)},
+            "error": str(e),
+        }
+
+
 @router.get("/health")
 async def health(include_db: bool = Query(False), include_ollama: bool = Query(False)):
     """Lightweight health check with optional deeper dependency probes."""

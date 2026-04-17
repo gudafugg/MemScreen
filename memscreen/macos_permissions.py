@@ -70,13 +70,23 @@ def open_privacy_settings(area: str) -> bool:
 def create_permission_message() -> str:
     runtime_path = _runtime_executable()
     app_hint = _app_bundle_hint()
-    return (
+    message = (
         "Screen recording permission is required.\n\n"
-        "Open macOS System Settings > Privacy & Security > Screen Recording, then allow:\n"
-        f"- {runtime_path}\n"
-        f"- {app_hint}\n\n"
-        "After granting access, quit and reopen MemScreen."
+        "Open macOS System Settings > Privacy & Security > Screen Recording:\n\n"
     )
+    if "python" in runtime_path.lower() or "venv" in runtime_path or "/usr/bin" in runtime_path:
+        # Source code run: terminal/ide needs permission
+        message += (
+            "🔹 **If you are running from source (via launch.sh):**\n"
+            f"   Allow your terminal app (Terminal/iTerm2) OR:\n"
+            f"   {runtime_path}\n\n"
+        )
+    message += (
+        "🔹 **If you are running MemScreen.app (installed):**\n"
+        f"   Allow {app_hint}\n\n"
+        "⚠️  **IMPORTANT:** After granting permission, you MUST QUIT and REOPEN MemScreen for changes to take effect.\n"
+    )
+    return message
 
 
 def check_screen_recording_permission(prompt: bool = False) -> Tuple[bool, str]:
@@ -190,3 +200,15 @@ def check_permission_with_cache() -> Tuple[bool, str]:
     granted, message = check_screen_recording_permission()
     _permission_cache = granted
     return granted, message
+
+
+def clear_permission_cache() -> None:
+    """Clear the permission cache, so next check will recheck from system."""
+    global _permission_cache
+    _permission_cache = None
+
+
+def force_recheck_permission(prompt: bool = False) -> Tuple[bool, str]:
+    """Clear cache and recheck permission from system."""
+    clear_permission_cache()
+    return check_screen_recording_permission(prompt=prompt)
